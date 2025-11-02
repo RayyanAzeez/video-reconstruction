@@ -1,0 +1,6 @@
+opencv-python
+numpy
+tqdm
+pillow
+imagehash
+scikit-image
