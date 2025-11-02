@@ -1,8 +1,4 @@
-# reconstruct_fixed.py
-# Dependencies:
-# pip install opencv-python numpy tqdm pillow imagehash scikit-image
-
-import os, cv2, math, time
+import os, cv2, time
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -44,7 +40,7 @@ def phash_order(frames_dir="frames"):
 # Utilities: load small grayscale arrays
 ########################
 def load_small_gray(fname, size=(128,128)):
-    img = Image.open(fname).convert("L")  # grayscale
+    img = Image.open(fname).convert("L")
     img = img.resize(size, Image.LANCZOS)
     arr = np.asarray(img, dtype=np.float32) / 255.0
     return arr
@@ -56,7 +52,6 @@ def build_ssim_matrix(filenames, frames_dir="frames", size=(128,128)):
     n = len(filenames)
     imgs = [load_small_gray(os.path.join(frames_dir,f), size=size) for f in filenames]
     S = np.zeros((n,n), dtype=np.float32)
-    # compute triangular and mirror to save time
     for i in tqdm(range(n), desc="SSIM matrix"):
         for j in range(i, n):
             if i == j:
@@ -65,11 +60,9 @@ def build_ssim_matrix(filenames, frames_dir="frames", size=(128,128)):
                 try:
                     val = ssim(imgs[i], imgs[j], data_range=1.0)
                 except Exception:
-                    # fallback robustly
                     val = np.corrcoef(imgs[i].ravel(), imgs[j].ravel())[0,1]
                     if np.isnan(val): val = 0.0
                     val = float(max(min(val,1.0), -1.0))
-                # clamp to [0,1]
                 if val < 0: val = 0.0
             S[i,j] = val
             S[j,i] = val
@@ -85,7 +78,6 @@ def greedy_nn_from(dist, start_idx):
     visited[start_idx] = True
     cur = start_idx
     for _ in range(n-1):
-        # select argmin over unvisited
         row = dist[cur].copy()
         row[visited] = np.inf
         nxt = int(np.argmin(row))
@@ -95,7 +87,7 @@ def greedy_nn_from(dist, start_idx):
     return order
 
 ########################
-# 5) 2-opt improvement (for path) — runs until no improvement
+# 5) 2-opt improvement
 ########################
 def two_opt_path(order, dist):
     n = len(order)
@@ -108,25 +100,21 @@ def two_opt_path(order, dist):
             a, b = order[i], order[i+1]
             for j in range(i+2, n):
                 c, d = order[j% n], order[(j+1) % n] if j+1 < n else None
-                # Calculate current cost and swapped cost
                 if j+1 >= n:
                     continue
                 cur_cost = dist[a,b] + dist[c,d]
                 new_cost = dist[a,c] + dist[b,d]
                 if new_cost + 1e-12 < cur_cost:
-                    # reverse segment i+1 .. j
                     order[i+1:j+1] = reversed(order[i+1:j+1])
                     improved = True
-        # small guard: stop early if too many loops
     return order
 
 ########################
-# 6) Choose start frame smartly
+# 6) Choose start frame
 ########################
 def choose_start(dist):
-    # choose index with largest summed distance to others (most unique)
     row_sums = dist.sum(axis=1)
-    start = int(np.argmin(row_sums))  # minimum similarity -> maximal uniqueness
+    start = int(np.argmin(row_sums))
     return start
 
 ########################
@@ -136,22 +124,18 @@ def reconstruct(frames_dir="frames", out_video="reconstructed_fixed.mp4", ssim_s
     files = sorted(os.listdir(frames_dir))
     n = len(files)
     print(f"Found {n} frames")
-    # 1. coarse pHash order
     coarse = phash_order(frames_dir)
     print("Coarse pHash order computed.")
-    # Option: process whole list or in chunks (to save memory/time)
     if chunk_size is None or chunk_size >= n:
         seq = coarse
         print("Building full SSIM matrix (this may take time for large n).")
-        S = build_ssim_matrix(seq, frames_dir=frames_dir, size=ssim_size)  # similarity
-        D = 1.0 - S  # distance
-        # choose start
+        S = build_ssim_matrix(seq, frames_dir=frames_dir, size=ssim_size)
+        D = 1.0 - S
         start = choose_start(D)
         order_idx = greedy_nn_from(D, start)
         order_idx = two_opt_path(order_idx, D)
         ordered_files = [seq[i] for i in order_idx]
     else:
-        # chunking: break coarse into overlapping chunks, refine each chunk, then stitch
         ordered_files = []
         i = 0
         while i < n:
@@ -162,9 +146,8 @@ def reconstruct(frames_dir="frames", out_video="reconstructed_fixed.mp4", ssim_s
             order_idx = greedy_nn_from(D, start)
             order_idx = two_opt_path(order_idx, D)
             chunk_ordered = [chunk[k] for k in order_idx]
-            ordered_files.extend(chunk_ordered if i==0 else chunk_ordered[5:])  # overlap-handling: keep some overlap
+            ordered_files.extend(chunk_ordered if i==0 else chunk_ordered[5:])
             i += chunk_size - 5
-        # final pass: small SSIM refine across entire ordered_files
         print("Final global refine across stitched sequence.")
         Sg = build_ssim_matrix(ordered_files, frames_dir=frames_dir, size=ssim_size)
         Dg = 1.0 - Sg
@@ -173,35 +156,30 @@ def reconstruct(frames_dir="frames", out_video="reconstructed_fixed.mp4", ssim_s
         order_idx = two_opt_path(order_idx, Dg)
         ordered_files = [ordered_files[i] for i in order_idx]
 
-    # orientation check (choose forward or reversed which yields larger total SSIM)
     ########################
-    # Correct orientation (guaranteed fix)
+    # orientation check
     ########################
 
     def enforce_correct_direction(order_files, frames_dir="frames", ssim_size=(128,128)):
-        # compute directional continuity score (flow-like heuristic)
         def continuity_score(seq):
             score = 0
             for a,b in zip(seq, seq[1:]):
                 A = load_small_gray(os.path.join(frames_dir, a), size=ssim_size)
                 B = load_small_gray(os.path.join(frames_dir, b), size=ssim_size)
-                score += np.sum(np.abs(B - A))   # brightness/motion difference
+                score += np.sum(np.abs(B - A))
             return score
 
         forward_score  = continuity_score(order_files)
         reverse_score  = continuity_score(list(reversed(order_files)))
 
         if reverse_score > forward_score:
-            print("⚠️  Reversed detected — flipping order.")
+            print("Reversed detected — flipping order.")
             return list(reversed(order_files))
         else:
-            print("✅ Correct orientation detected.")
+            print("Correct orientation detected.")
             return order_files
     ordered_files = enforce_correct_direction(ordered_files, frames_dir=frames_dir, ssim_size=ssim_size)
-
-
-
-    # write video
+    
     first = cv2.imread(os.path.join(frames_dir, ordered_files[0]))
     h, w, _ = first.shape
     fps = 30
@@ -214,7 +192,7 @@ def reconstruct(frames_dir="frames", out_video="reconstructed_fixed.mp4", ssim_s
     
 
 ########################
-# 8) Run (example)
+# 8) Run
 ########################
 if __name__ == "__main__":
     start_t = time.time()
@@ -222,9 +200,7 @@ if __name__ == "__main__":
     print("Extracting frames...")
     n = extract_frames(video, out_dir="frames")
     print(f"{n} frames extracted.")
-    # chunk_size=None -> full SSIM matrix. For 300 frames this is OK.
-    out, ordering = reconstruct(frames_dir="frames", out_video="rec1.mp4", ssim_size=(128,128), chunk_size=None)
-
+    out, ordering = reconstruct(frames_dir="frames", out_video="reconstructed_output.mp4", ssim_size=(128,128), chunk_size=None)
 
     print("Done. Output:", out)
     print("Elapsed (s):", time.time() - start_t)

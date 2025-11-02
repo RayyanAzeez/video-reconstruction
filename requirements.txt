@@ -4,3 +4,4 @@ tqdm
 pillow
 imagehash
 scikit-image
+scipy
